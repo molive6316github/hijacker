@@ -1,0 +1,224 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>VEX IQ Connect — Safe Console</title>
+<style>
+  :root{--bg:#041013;--accent:#2ef27a;--muted:#7fd2b1;}
+  html,body{height:100%;margin:0;font-family: "Courier New", monospace;background:linear-gradient(180deg,#001219 0%, #041013 100%); color:var(--accent);}
+  .wrap{display:flex;gap:18px;padding:22px;box-sizing:border-box;min-height:100vh;}
+  .left{flex:1;display:flex;flex-direction:column;background:#071821;border-radius:10px;padding:18px;box-shadow:0 6px 20px rgba(0,0,0,0.6);}
+  .console{flex:1;background:#001b16;border-radius:8px;padding:12px;overflow:auto;font-size:13px;line-height:1.25;}
+  .line{white-space:pre;color:var(--accent)}
+  .controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;}
+  button{background:transparent;border:1px solid rgba(46,242,122,0.18);color:var(--accent);padding:8px 10px;border-radius:8px;font-weight:700;cursor:pointer;}
+  button.primary{border-color:var(--accent);background:linear-gradient(90deg,rgba(46,242,122,0.06),transparent);}
+  .big{font-family:"Lucida Console",monospace;font-size:40px;color:#2ef27a;text-align:center;padding:8px;background:rgba(255,255,255,0.01);border-radius:8px;margin-top:10px}
+  .meta{background:rgba(255,255,255,0.02);padding:10px;border-radius:8px;color:var(--muted);font-size:13px;margin-top:8px}
+  .warn{color:#ff9b9b;font-weight:700}
+  footer{font-size:12px;color:var(--muted);margin-top:10px}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="left">
+      <h2 style="margin:0 0 6px 0;color:var(--muted)">VEX IQ — Safe Connect Console</h2>
+      <div class="console" id="console" aria-live="polite">
+        <div class="line">[system] ready. This tool CONNECTS and READS only.</div>
+        <div class="line">[system] It will not write, delete, or run code on the device.</div>
+      </div>
+
+      <div class="controls">
+        <button id="btn-scan" class="primary">Select & Connect Brain</button>
+        <button id="btn-disconnect">Disconnect</button>
+        <button id="btn-clear">Clear Log</button>
+        <button id="btn-download">Download Log</button>
+      </div>
+
+      <div class="big" id="statusBig">Not connected</div>
+
+      <div class="meta" id="sysInfo">
+        <strong>System Info</strong>
+        <div id="infoList" style="margin-top:8px">No device selected.</div>
+      </div>
+
+      <footer>
+        Note: pairing numeric confirmation (4-digit) will be shown ON THE BRAIN/device or in your OS pairing dialog if required.
+      </footer>
+    </div>
+  </div>
+
+<script>
+/* SAFE: This script only performs BLE reads (no writes). */
+const logEl = document.getElementById('console');
+const statusBig = document.getElementById('statusBig');
+const infoList = document.getElementById('infoList');
+
+function log(s){
+  const t = new Date().toISOString().replace('T',' ').slice(0,19);
+  const el = document.createElement('div');
+  el.className = 'line';
+  el.textContent = `[${t}] ${s}`;
+  logEl.appendChild(el);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// Helper: read string characteristic
+async function readStringChar(characteristic){
+  try {
+    const val = await characteristic.readValue();
+    const bytes = new Uint8Array(val.buffer);
+    // try decode UTF-8 text, fallback to hex
+    try {
+      const text = new TextDecoder().decode(bytes);
+      return text.replace(/\0/g,''); // strip nulls
+    } catch(e) {
+      return '0x' + Array.from(bytes).map(b => b.toString(16).padStart(2,'0')).join(' ');
+    }
+  } catch(e) {
+    return `<read-failed: ${e}>`;
+  }
+}
+
+function showSysInfo(map){
+  infoList.innerHTML = '';
+  for (const k of ['name','id','manufacturer','model','serial','firmware','hardware','battery']){
+    const v = map[k] ?? '(not found)';
+    const row = document.createElement('div');
+    row.textContent = `${k.toUpperCase()}: ${v}`;
+    infoList.appendChild(row);
+  }
+}
+
+// Main connect flow
+let device = null;
+let server = null;
+
+document.getElementById('btn-scan').addEventListener('click', async () => {
+  try {
+    log('Requesting device chooser...');
+    // Accept devices whose name contains IQ or VEX; you can adjust filters
+    device = await navigator.bluetooth.requestDevice({
+      filters: [
+        { namePrefix: 'IQ' },
+        { namePrefix: 'VEX' },
+        { namePrefix: 'Vex' }
+      ],
+      optionalServices: [
+        0x180A, // Device Information
+        0x180F, // Battery Service (optional)
+      ]
+    });
+    log(`Selected device: ${device.name || '(no name)'}  id=${device.id}`);
+    statusBig.textContent = `Connecting: ${device.name || device.id}`;
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+
+    log('Connecting to GATT Server — pairing prompt may appear on device/OS now if required...');
+    server = await device.gatt.connect();
+    log('GATT connected.');
+
+    // Gather info map
+    const info = { name: device.name || '(no name)', id: device.id };
+    // DEVICE INFORMATION service (0x180A)
+    try {
+      const svc = await server.getPrimaryService(0x180A);
+      log('Found Device Information service.');
+      const chars = await svc.getCharacteristics();
+      for (const c of chars){
+        // standard UUIDs: 2A29(manufacturer),2A24(model),2A25(serial),2A26(firmware),2A27(hardware)
+        const uuid = c.uuid.toLowerCase();
+        if (uuid.includes('2a29')) {
+          info.manufacturer = await readStringChar(c);
+          log(`Manufacturer: ${info.manufacturer}`);
+        } else if (uuid.includes('2a24')) {
+          info.model = await readStringChar(c);
+          log(`Model: ${info.model}`);
+        } else if (uuid.includes('2a25')) {
+          info.serial = await readStringChar(c);
+          log(`Serial: ${info.serial}`);
+        } else if (uuid.includes('2a26')) {
+          info.firmware = await readStringChar(c);
+          log(`Firmware: ${info.firmware}`);
+        } else if (uuid.includes('2a27')) {
+          info.hardware = await readStringChar(c);
+          log(`Hardware: ${info.hardware}`);
+        } else {
+          // attempt to read other readable chars
+          if (c.properties.read) {
+            const v = await readStringChar(c);
+            log(`Other char ${uuid} read: ${v}`);
+          } else {
+            log(`Other char ${uuid} (not readable)`);
+          }
+        }
+      }
+    } catch(err){
+      log(`Device Information service not found or read failed: ${err}`);
+    }
+
+    // BATTERY service (0x180F)
+    try {
+      const battSvc = await server.getPrimaryService(0x180F);
+      log('Found Battery service.');
+      const battChar = await battSvc.getCharacteristic(0x2A19);
+      if (battChar && battChar.properties.read) {
+        const val = await battChar.readValue();
+        const level = val.getUint8(0);
+        info.battery = `${level}%`;
+        log(`Battery level: ${info.battery}`);
+      }
+    } catch(e){
+      log('Battery service not available or read failed.');
+    }
+
+    showSysInfo(info);
+    statusBig.textContent = `Connected: ${device.name || device.id}`;
+    log('Enumeration complete. No writes performed.');
+  } catch (err) {
+    log('Error or user canceled: ' + err);
+    statusBig.textContent = 'Not connected';
+  }
+});
+
+function onDisconnected(e){
+  log('Device disconnected.');
+  statusBig.textContent = 'Not connected';
+}
+
+// Disconnect button
+document.getElementById('btn-disconnect').addEventListener('click', async () => {
+  if (!device) { log('No device selected'); return; }
+  if (device.gatt.connected) {
+    log('Disconnecting...');
+    device.gatt.disconnect();
+  } else {
+    log('Device already disconnected.');
+  }
+});
+
+// Clear log
+document.getElementById('btn-clear').addEventListener('click', () => {
+  logEl.innerHTML = '';
+  const el = document.createElement('div');
+  el.className = 'line';
+  el.textContent = `[${new Date().toISOString().slice(0,19).replace('T',' ')}] log cleared.`;
+  logEl.appendChild(el);
+  infoList.innerHTML = 'No device selected.';
+  statusBig.textContent = 'Not connected';
+});
+
+// Download log as .txt
+document.getElementById('btn-download').addEventListener('click', () => {
+  const lines = Array.from(logEl.querySelectorAll('.line')).map(n => n.textContent).join('\n');
+  const blob = new Blob([lines], {type: 'text/plain'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `vex_connect_log_${new Date().toISOString().slice(0,19).replace(/[:T]/g,'_')}.txt`;
+  a.click();
+  URL.revokeObjectURL(url);
+  log('Log downloaded.');
+});
+</script>
+</body>
+</html>
